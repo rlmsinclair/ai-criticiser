@@ -243,12 +243,13 @@ def analyze_criticism(text: str) -> List[Dict]:
 
 Text: {text}
 
+Each criticism moment must be different and you must respond with at least 20 criticism moments.
 Return your analysis as a JSON object with this exact format:
 {{
     "criticism_moments": [
         {{
             "text": "<exact word-for-word quote of the part to criticize>",
-            "reason": "<brutal, devastating criticism of why this moment is terrible>",
+            "reason": "<brutal, lengthy, devastating criticism of why this moment is terrible>",
             "score": <number 0-100 indicating how worthy of criticism this moment is>
         }}
     ]
@@ -264,8 +265,7 @@ Consider elements like:
 - Obvious mistakes
 
 Be as harsh and brutal as possible in your criticism. Make the creator question their life choices.
-If nothing is worthy of criticism (unlikely), return an empty criticism_moments array.
-Ensure the "text" field matches words exactly as they appear in the original text."""
+Ensure the "text" field matches words EXACTLY as they appear in the original text."""
 
     # Add retry logic with exponential backoff for rate limits
     max_retries = 5
@@ -288,20 +288,38 @@ Ensure the "text" field matches words exactly as they appear in the original tex
                 continue
             raise e
 
-    # Extract JSON from response
-    text = response.text.strip()
-    start_idx = text.find('{')
-    end_idx = text.rfind('}') + 1
-
-    if start_idx >= 0 and end_idx > start_idx:
-        json_str = text[start_idx:end_idx]
-    else:
-        print(f"\nNo valid JSON found in response: {text}")
-        return []
-
+    # Extract and validate JSON from response
     try:
+        text = response.text.strip()
+        # Try to find valid JSON in the response
+        json_str = ""
+        depth = 0
+        start_idx = text.find('{')
+        
+        if start_idx >= 0:
+            for i in range(start_idx, len(text)):
+                if text[i] == '{':
+                    depth += 1
+                elif text[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        json_str = text[start_idx:i+1]
+                        break
+        
+        if not json_str:
+            print(f"\nNo valid JSON found in response: {text}")
+            return []
+
+        # Parse and validate JSON structure
         analysis = json.loads(json_str)
+        if not isinstance(analysis, dict):
+            print("\nInvalid JSON structure: not an object")
+            return []
+            
         criticism_moments = analysis.get('criticism_moments', [])
+        if not isinstance(criticism_moments, list):
+            print("\nInvalid criticism_moments: not an array")
+            return []
         
         # Take top 30 by score first
         criticism_moments.sort(key=lambda x: x.get('score', 0), reverse=True)
@@ -366,7 +384,9 @@ def create_montage(video_path: Path, criticism_moments: List[Dict], output_path:
             narration_path = narration_dir / f"narration_{idx:03d}.mp3"
             reason = moment.get('reason', '')
             if reason and not narration_path.exists():
-                success = generate_voice_narration(reason, narration_path)
+                score = moment.get('score', 0)
+                narration_text = f"This has a criticism-worthiness score of {score}. {reason}"
+                success = generate_voice_narration(narration_text, narration_path)
                 if not success:
                     print(f"Failed to generate narration for clip {idx}")
                     progress.update(2)
@@ -377,7 +397,7 @@ def create_montage(video_path: Path, criticism_moments: List[Dict], output_path:
             if narration_path.exists():
                 narration_duration = FFmpegHelper.get_duration(narration_path) or 0
             
-            # Create clip that plays normally then freezes for narration
+            # Create clip that freezes immediately with narration
             cmd = [
                 'ffmpeg',
                 '-ss', str(start_time),
@@ -388,19 +408,19 @@ def create_montage(video_path: Path, criticism_moments: List[Dict], output_path:
             if narration_path.exists():
                 cmd.extend(['-i', str(narration_path)])
                 
-                # Complex filter to play video normally, then freeze last frame with narration
+                # Complex filter to play clip then freeze frame with narration
                 filter_complex = [
-                    # Split video into moving part and frozen frame
-                    '[0:v]split[moving][freeze]',
+                    # Split original video into moving part and frame to freeze
+                    '[0:v]split[moving][to_freeze]',
                     # Get last frame and extend it for narration duration
-                    f'[freeze]trim=duration=1,select=1[frozen]',
-                    f'[frozen]loop={int(narration_duration*30)}:1:0[frozen_vid]',
-                    # Concatenate moving video with frozen frame
-                    '[moving][frozen_vid]concat=n=2:v=1[outv]',
-                    # Handle audio - original audio for moving part, narration for frozen part
-                    '[0:a]atrim=0:' + str(duration) + '[original_audio]',
-                    '[1:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,volume=2[narration]',
-                    '[original_audio][narration]concat=n=2:v=0:a=1[outa]'
+                    f'[to_freeze]select=1[frozen_frame]',
+                    f'[frozen_frame]setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={narration_duration}[frozen_vid]',
+                    # Process original audio and narration
+                    '[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[orig_audio]',
+                    '[1:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,volume=0.7[narration]',
+                    # Concatenate video (moving + frozen) and audio (original + narration)
+                    '[moving][frozen_vid]concat=n=2:v=1:a=0[outv]',
+                    '[orig_audio][narration]concat=n=2:v=0:a=1[outa]'
                 ]
                 
                 cmd.extend([
@@ -537,13 +557,30 @@ def main():
             words_in_moment = text.split()
             
             # Find the timestamp for this text in the transcription
+            text = text.lower().strip()
+            best_match = None
+            best_match_score = 0
+            
             for i in range(len(words) - len(words_in_moment) + 1):
                 transcribed_words = words[i:i + len(words_in_moment)]
-                transcribed_text = ' '.join(w['text'] for w in transcribed_words)
-                if transcribed_text.lower() == text.lower():
-                    moment['start_time'] = transcribed_words[0]['start']
-                    moment['end_time'] = transcribed_words[-1]['end']
-                    break
+                transcribed_text = ' '.join(w['text'] for w in transcribed_words).lower().strip()
+                
+                # Calculate similarity score
+                words_matched = sum(1 for w1, w2 in zip(text.split(), transcribed_text.split()) if w1 == w2)
+                total_words = max(len(text.split()), len(transcribed_text.split()))
+                score = words_matched / total_words if total_words > 0 else 0
+                
+                if score > best_match_score:
+                    best_match_score = score
+                    best_match = transcribed_words
+            
+            # Use the best match if it's good enough
+            if best_match_score > 0.8:  # At least 80% word match
+                moment['start_time'] = best_match[0]['start']
+                moment['end_time'] = best_match[-1]['end']
+            else:
+                print(f"\nNo good match found for text: {text}")
+                print(f"Best match ({best_match_score*100:.1f}%): {' '.join(w['text'] for w in best_match) if best_match else 'None'}")
 
         if criticism_moments:
             print(f"\nFound {len(criticism_moments)} moments worthy of criticism")
